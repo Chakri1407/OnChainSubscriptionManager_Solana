@@ -122,7 +122,7 @@ pub struct CreateSubscription<'info> {
     #[account(
         init,
         payer = user,
-        space = 8 + 32 + 8 + 8 + 8 + 8 + 1 + (4 + 50 * 8), // Discriminator + fields + Vec with max 50 entries
+        space = 8 + 32 + 8 + 8 + 8 + 8 + 1 + 12, // 85 bytes for one history entry
         seeds = [b"subscription", user.key().as_ref(), plan_id.to_le_bytes().as_ref()],
         bump
     )]

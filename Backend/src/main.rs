@@ -9,7 +9,7 @@ use actix_web::{
 use dotenv::dotenv;
 use log::info;
 use serde::{Deserialize, Serialize};
-use solana_client::nonblocking::rpc_client::RpcClient; // Use non-blocking RpcClient
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     pubkey::Pubkey,
     signature::Signature,
@@ -17,15 +17,16 @@ use solana_sdk::{
     instruction::Instruction,
     system_program,
     message::Message,
+    signer::keypair::Keypair,
 };
-use borsh::{BorshDeserialize, BorshSerialize};
-use base64::{engine::general_purpose, Engine as _};
+use solana_client::rpc_request::{RpcError, RpcResponseErrorData};
+use anchor_lang::solana_program::hash::hash; // For Anchor discriminator
+use borsh::{BorshDeserialize, BorshSerialize}; // Use borsh crate directly
 use jsonwebtoken::{encode, Header, EncodingKey, Validation};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::str::FromStr;
-use bincode;
 use middlewares::Authentication;
-use std::sync::Arc; // Add Arc for shared ownership
+use std::sync::Arc;
 
 // Configuration
 #[derive(Clone)]
@@ -36,6 +37,7 @@ pub struct Config {
     program_id: Pubkey,
     jwt_secret: String,
     treasury: Pubkey,
+    phantom_private_key: String,
 }
 
 pub fn get_config() -> Config {
@@ -52,9 +54,10 @@ pub fn get_config() -> Config {
             .expect("Invalid program ID"),
         jwt_secret: std::env::var("JWT_SECRET").expect("JWT_SECRET must be set"),
         treasury: Pubkey::from_str(
-            &std::env::var("TREASURY_PUBKEY").unwrap_or_else(|_| "TREASURY_PUBKEY_HERE".to_string()),
+            &std::env::var("TREASURY_PUBKEY").unwrap_or_else(|_| "3WCHd9Z57YfUFb9kaUkq5nyQjyWMVLVHigvYfvSfsHEG".to_string()),
         )
         .expect("Invalid treasury pubkey"),
+        phantom_private_key: std::env::var("PHANTOM_PRIVATE_KEY").expect("PHANTOM_PRIVATE_KEY must be set"),
     }
 }
 
@@ -143,17 +146,25 @@ pub type AppResult<T> = Result<T, AppError>;
 // Solana Service
 #[derive(Clone)]
 pub struct SolanaService {
-    rpc_client: Arc<RpcClient>, // Use Arc to make RpcClient clonable
+    rpc_client: Arc<RpcClient>,
     program_id: Pubkey,
     treasury: Pubkey,
+    phantom_keypair: Arc<Keypair>,
 }
 
 impl SolanaService {
     pub fn new(config: &Config) -> Self {
+        let private_key_bytes = bs58::decode(&config.phantom_private_key)
+            .into_vec()
+            .expect("Invalid PHANTOM_PRIVATE_KEY format");
+        let keypair = Keypair::from_bytes(&private_key_bytes)
+            .expect("Failed to parse Phantom private key");
+
         Self {
             rpc_client: Arc::new(RpcClient::new(config.solana_rpc_url.clone())),
             program_id: config.program_id,
             treasury: config.treasury,
+            phantom_keypair: Arc::new(keypair),
         }
     }
 
@@ -170,7 +181,7 @@ impl SolanaService {
             &self.program_id,
         );
 
-        let mut data = vec![0, 0, 0, 0]; // Placeholder discriminator
+        let mut data = hash("global:create_subscription".as_bytes()).to_bytes()[..8].to_vec();
         data.extend_from_slice(&req.plan_id.to_le_bytes());
         data.extend_from_slice(&req.duration.to_le_bytes());
         data.extend_from_slice(&req.amount.to_le_bytes());
@@ -191,13 +202,23 @@ impl SolanaService {
             .await
             .map_err(|e| AppError::SolanaError(format!("Failed to get blockhash: {}", e)))?;
         let message = Message::new_with_blockhash(&[instruction], Some(&owner_pubkey), &recent_blockhash);
-        let tx = Transaction::new_unsigned(message);
+        let mut tx = Transaction::new_unsigned(message);
 
-        let serialized_tx = general_purpose::STANDARD.encode(
-            bincode::serialize(&tx).map_err(|e| AppError::InternalServerError(format!("Serialization error: {}", e)))?,
-        );
+        tx.sign(&[&self.phantom_keypair], recent_blockhash);
 
-        Ok(serialized_tx)
+        let signature = self.rpc_client
+            .send_and_confirm_transaction(&tx)
+            .await
+            .map_err(|e| {
+                if let solana_client::client_error::ClientErrorKind::RpcError(RpcError::RpcResponseError { data, .. }) = &e.kind() {
+                    if let RpcResponseErrorData::SendTransactionPreflightFailure(sim) = data {
+                        log::error!("Transaction simulation failed: {:?}", sim.logs);
+                    }
+                }
+                AppError::SolanaError(format!("Transaction failed: {}", e))
+            })?;
+
+        Ok(signature.to_string())
     }
 
     pub async fn get_subscription(&self, owner: &str, plan_id: u64) -> AppResult<SubscriptionResponse> {
@@ -209,13 +230,16 @@ impl SolanaService {
             &self.program_id,
         );
 
+        log::info!("Fetching subscription PDA: {}", subscription_pda);
+
         let account = self.rpc_client
             .get_account(&subscription_pda)
             .await
-            .map_err(|e| AppError::SolanaError(format!("Failed to fetch account: {}", e)))?
-            .data;
+            .map_err(|e| AppError::SolanaError(format!("Failed to fetch account: {}", e)))?;
 
-        let subscription: Subscription = BorshDeserialize::try_from_slice(&account[8..])
+        log::info!("Raw account data (len={}): {:?}", account.data.len(), account.data);
+
+        let subscription = Subscription::try_from_slice(&account.data[8..])
             .map_err(|e| AppError::SolanaError(format!("Deserialization error: {}", e)))?;
 
         Ok(SubscriptionResponse {
@@ -239,7 +263,7 @@ impl SolanaService {
             &self.program_id,
         );
 
-        let data = vec![1, 0, 0, 0]; // Placeholder discriminator
+        let data = hash("global:renew_subscription".as_bytes()).to_bytes()[..8].to_vec();
         let instruction = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -256,13 +280,16 @@ impl SolanaService {
             .await
             .map_err(|e| AppError::SolanaError(format!("Failed to get blockhash: {}", e)))?;
         let message = Message::new_with_blockhash(&[instruction], Some(&owner_pubkey), &recent_blockhash);
-        let tx = Transaction::new_unsigned(message);
+        let mut tx = Transaction::new_unsigned(message);
 
-        let serialized_tx = general_purpose::STANDARD.encode(
-            bincode::serialize(&tx).map_err(|e| AppError::InternalServerError(format!("Serialization error: {}", e)))?,
-        );
+        tx.sign(&[&self.phantom_keypair], recent_blockhash);
 
-        Ok(serialized_tx)
+        let signature = self.rpc_client
+            .send_and_confirm_transaction(&tx)
+            .await
+            .map_err(|e| AppError::SolanaError(format!("Transaction failed: {}", e)))?;
+
+        Ok(signature.to_string())
     }
 }
 
@@ -357,10 +384,10 @@ pub async fn create_subscription(
     sub_req: web::Json<SubscriptionRequest>,
 ) -> AppResult<HttpResponse> {
     let auth_token = req.extensions().get::<AuthToken>().ok_or(AppError::Auth("No auth token found".to_string()))?.clone();
-    let serialized_tx = solana_service
+    let signature = solana_service
         .create_subscription(&auth_token.public_key, sub_req.into_inner())
         .await?;
-    Ok(HttpResponse::Ok().json(serde_json::json!({ "transaction": serialized_tx })))
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "signature": signature })))
 }
 
 #[get("/subscriptions/{plan_id}")]
@@ -383,12 +410,12 @@ pub async fn renew_subscription(
 ) -> AppResult<HttpResponse> {
     let auth_token = req.extensions().get::<AuthToken>().ok_or(AppError::Auth("No auth token found".to_string()))?.clone();
     let plan_id = path.into_inner();
-    let serialized_tx = solana_service.renew_subscription(&auth_token.public_key, plan_id).await?;
-    Ok(HttpResponse::Ok().json(serde_json::json!({ "transaction": serialized_tx })))
+    let signature = solana_service.renew_subscription(&auth_token.public_key, plan_id).await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "signature": signature })))
 }
 
 // Main
-#[tokio::main(worker_threads = 4)] // Use multi-threaded runtime
+#[tokio::main(worker_threads = 4)]
 async fn main() -> std::io::Result<()> {
     dotenv().ok();
     env_logger::init();
@@ -411,7 +438,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(cors)
             .app_data(Data::new(auth_service.clone()))
             .app_data(Data::new(solana_service.clone()))
-            .service(authenticate) // Public /auth endpoint
+            .service(authenticate)
             .service(
                 web::scope("/api")
                     .wrap(Authentication::new(auth_service.clone()))

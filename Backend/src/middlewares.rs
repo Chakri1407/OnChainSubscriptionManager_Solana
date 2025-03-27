@@ -68,7 +68,7 @@ where
 
         match auth_service.verify_token(&token) {
             Ok(auth_token) => {
-                let mut req = req; // Rebind to make mutable only where needed
+                let req = req; 
                 req.extensions_mut().insert(auth_token);
                 let fut = self.service.call(req);
                 Box::pin(async move { fut.await })

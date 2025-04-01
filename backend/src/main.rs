@@ -50,7 +50,7 @@ pub fn get_config() -> Config {
             .unwrap_or(8080),
         solana_rpc_url: std::env::var("SOLANA_RPC_URL")
             .unwrap_or_else(|_| "https://api.devnet.solana.com".to_string()),
-        program_id: Pubkey::from_str("5LNxghcjrSXM2BR3hKC1QinFBHx1c6rxuJfbwjRtBBVt")
+        program_id: Pubkey::from_str("GVkmkRg63U7QRES1fksSBSQhMFgydMa3oATDby7QyJEp")
             .expect("Invalid program ID"),
         jwt_secret: std::env::var("JWT_SECRET").expect("JWT_SECRET must be set"),
         treasury: Pubkey::from_str(

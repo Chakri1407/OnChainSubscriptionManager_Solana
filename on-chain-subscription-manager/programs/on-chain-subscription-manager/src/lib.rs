@@ -1,32 +1,30 @@
 use anchor_lang::prelude::*;
 
-declare_id!("5LNxghcjrSXM2BR3hKC1QinFBHx1c6rxuJfbwjRtBBVt");
+declare_id!("GVkmkRg63U7QRES1fksSBSQhMFgydMa3oATDby7QyJEp");
+
+const SUBSCRIPTION_DURATION: u64 = 60; // 60 seconds
+const SUBSCRIPTION_AMOUNT: u64 = 10_000_000; // 0.01 SOL in lamports (1 SOL = 1_000_000_000 lamports)
 
 #[program]
 pub mod on_chain_subscription_manager {
     use super::*;
 
-    pub fn create_subscription(
-        ctx: Context<CreateSubscription>,
-        plan_id: u64,
-        duration: u64,
-        amount: u64,
-    ) -> Result<()> {
+    pub fn create_subscription(ctx: Context<CreateSubscription>, plan_id: u64) -> Result<()> {
         let subscription = &mut ctx.accounts.subscription;
         let current_time = Clock::get()?.unix_timestamp;
 
         subscription.user = *ctx.accounts.user.key;
         subscription.plan_id = plan_id;
         subscription.start_time = current_time;
-        subscription.duration = duration;
-        subscription.amount = amount;
+        subscription.duration = SUBSCRIPTION_DURATION;
+        subscription.amount = SUBSCRIPTION_AMOUNT;
         subscription.active = true;
         subscription.history = vec![current_time];
 
         let ix = anchor_lang::solana_program::system_instruction::transfer(
             ctx.accounts.user.key,
             &ctx.accounts.treasury.key(),
-            amount,
+            SUBSCRIPTION_AMOUNT,
         );
         anchor_lang::solana_program::program::invoke(
             &ix,
@@ -38,16 +36,8 @@ pub mod on_chain_subscription_manager {
         Ok(())
     }
 
-    pub fn update_subscription(
-        ctx: Context<UpdateSubscription>,
-        new_duration: u64,
-        new_amount: u64,
-    ) -> Result<()> {
-        let subscription = &mut ctx.accounts.subscription;
-        require!(subscription.active, SubscriptionError::InactiveSubscription);
-        subscription.duration = new_duration;
-        subscription.amount = new_amount;
-        Ok(())
+    pub fn update_subscription(_ctx: Context<UpdateSubscription>) -> Result<()> {
+        Err(SubscriptionError::FixedParameters.into())
     }
 
     pub fn renew_subscription(ctx: Context<RenewSubscription>) -> Result<()> {
@@ -63,7 +53,7 @@ pub mod on_chain_subscription_manager {
         let ix = anchor_lang::solana_program::system_instruction::transfer(
             ctx.accounts.user.key,
             &ctx.accounts.treasury.key(),
-            subscription.amount,
+            SUBSCRIPTION_AMOUNT,
         );
         anchor_lang::solana_program::program::invoke(
             &ix,
@@ -73,9 +63,8 @@ pub mod on_chain_subscription_manager {
             ],
         )?;
 
-        // Limit history size to prevent excessive growth
         if subscription.history.len() >= 10 {
-            subscription.history.remove(0); // Remove oldest entry
+            subscription.history.remove(0);
         }
         subscription.history.push(current_time);
         subscription.start_time = current_time;
@@ -114,7 +103,7 @@ pub struct CreateSubscription<'info> {
     #[account(
         init,
         payer = user,
-        space = 8 + 32 + 8 + 8 + 8 + 8 + 1 + 4 + (10 * 8), // Discriminator + fields + Vec with 10 i64s
+        space = 8 + 32 + 8 + 8 + 8 + 8 + 1 + 4 + (10 * 8),
         seeds = [b"subscription", user.key().as_ref(), plan_id.to_le_bytes().as_ref()],
         bump
     )]
@@ -171,4 +160,6 @@ pub enum SubscriptionError {
     Unauthorized,
     #[msg("Subscription has not yet expired")]
     NotYetExpired,
+    #[msg("Subscription parameters are fixed and cannot be updated")]
+    FixedParameters,
 }

@@ -6,7 +6,7 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-on_chain_subscription_manager = "5LNxghcjrSXM2BR3hKC1QinFBHx1c6rxuJfbwjRtBBVt"
+on_chain_subscription_manager = "GVkmkRg63U7QRES1fksSBSQhMFgydMa3oATDby7QyJEp"
 
 [registry]
 url = "https://api.apr.dev"
